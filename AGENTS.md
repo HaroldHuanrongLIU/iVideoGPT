@@ -9,10 +9,11 @@
 Install the base environment with:
 
 ```bash
-conda create -n ivideogpt python==3.9
-conda activate ivideogpt
-pip install -r requirements.txt
+uv sync
+source .venv/bin/activate
 ```
+
+`uv sync` uses Python 3.11 and installs only the SurgWMBench training/evaluation dependencies, including CUDA 13.0 PyTorch wheels configured in `pyproject.toml`.
 
 Run a prediction smoke test with:
 

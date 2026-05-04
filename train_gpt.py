@@ -19,7 +19,6 @@ import os
 from pathlib import Path
 import imageio
 
-import datasets
 import torch
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
@@ -42,6 +41,11 @@ from ivideogpt.vq_model import CompressiveVQModel
 from ivideogpt.transformer import HeadModelWithAction
 from ivideogpt.data import *
 from peft import LoraConfig, TaskType, get_peft_model
+
+try:
+    import datasets
+except ImportError:
+    datasets = None
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
 # check_min_version("4.39.0.dev0")
@@ -577,10 +581,12 @@ def start_train():
     )
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
-        datasets.utils.logging.set_verbosity_warning()
+        if datasets is not None:
+            datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_info()
     else:
-        datasets.utils.logging.set_verbosity_error()
+        if datasets is not None:
+            datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
 
     # If passed along, set the training seed now.

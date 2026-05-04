@@ -20,10 +20,13 @@ This repo provides official code and checkpoints for iVideoGPT, a generic and ef
 ## 🛠️ Installation
 
 ```bash
-conda create -n ivideogpt python==3.9
-conda activate ivideogpt
-pip install -r requirements.txt
+uv sync
+source .venv/bin/activate
 ```
+
+The `uv` environment uses Python 3.11 and installs only the packages needed for
+SurgWMBench training/evaluation, including CUDA 13.0 PyTorch wheels declared in
+`pyproject.toml`.
 
 To evaluate the FVD metric, download the [pretrained I3D model](https://www.dropbox.com/s/ge9e5ujwgetktms/i3d_torchscript.pt?dl=1) into `pretrained_models/i3d/i3d_torchscript.pt`.
 
