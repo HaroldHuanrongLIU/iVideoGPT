@@ -537,6 +537,8 @@ def main():
             **segment_args,
         )
 
+    train_dataloader, eval_dataloader = accelerator.prepare(train_dataloader, eval_dataloader)
+
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if num_update_steps_per_epoch == 0:
         raise ValueError("Training dataloader is empty.")
@@ -561,9 +563,9 @@ def main():
         num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
     )
 
-    # Prepare everything with accelerator
+    # Prepare everything with accelerator. Dataloaders are prepared above before
+    # computing step counts so distributed runs shard data correctly.
     logger.info("Preparing model, optimizer and dataloaders")
-    # The dataloader are already aware of distributed training, so we don't need to prepare them.
     model, discriminator, optimizer, discr_optimizer, lr_scheduler, discr_lr_scheduler = accelerator.prepare(
         model, discriminator, optimizer, discr_optimizer, lr_scheduler, discr_lr_scheduler
     )
@@ -905,9 +907,9 @@ def main():
                 if global_step % args.checkpointing_steps == 0:
                     save_checkpoint(model, discriminator, args, accelerator, global_step)
 
-            if accelerator.sync_gradients and generator_step and accelerator.is_main_process:
+            if accelerator.sync_gradients and generator_step:
                 # Generate images
-                if global_step % args.log_image_steps == 1:
+                if accelerator.is_main_process and global_step % args.log_image_steps == 1:
                     with torch.no_grad():
                         save_path = os.path.join(args.output_dir, "images", f"train-samples-{global_step}")
                         os.makedirs(save_path, exist_ok=True)
@@ -952,7 +954,11 @@ def main():
                         recon_losses = []
                         perceptual_losses = []
                         val_iters = 100
-                        bar = tqdm(range(val_iters), desc="validation")
+                        bar = tqdm(
+                            range(val_iters),
+                            desc="validation",
+                            disable=not accelerator.is_local_main_process,
+                        )
 
                         for i, batch in enumerate(eval_dataloader):
                             if i == val_iters:
@@ -1003,7 +1009,7 @@ def main():
                             perceptual_losses.append(perceptual_loss)
 
                             # log images
-                            if i % 10 == 0:
+                            if accelerator.is_main_process and i % 10 == 0:
                                 save_path = os.path.join(args.output_dir, "images", f"val-samples-{global_step}")
                                 os.makedirs(save_path, exist_ok=True)
                                 segment_length = args.segment_length - args.context_length
@@ -1041,11 +1047,17 @@ def main():
                                     save_path, f'val-samples-{global_step}-{i}.png'), np.concatenate([gt, recon, diff, error], 0))
 
                             bar.update(1)
-
-                        accelerator.log({
-                            'val_loss/recon_loss': torch.stack(recon_losses).mean().item(),
-                            'val_loss/perceptual_loss': torch.stack(perceptual_losses).mean().item(),
-                        }, step=global_step)
+                        if not recon_losses:
+                            raise ValueError("Validation dataloader is empty on this process.")
+                        local_recon_loss = torch.stack(recon_losses).mean()
+                        local_perceptual_loss = torch.stack(perceptual_losses).mean()
+                        val_recon_loss = accelerator.gather(local_recon_loss.reshape(1)).mean()
+                        val_perceptual_loss = accelerator.gather(local_perceptual_loss.reshape(1)).mean()
+                        if accelerator.is_main_process:
+                            accelerator.log({
+                                'val_loss/recon_loss': val_recon_loss.item(),
+                                'val_loss/perceptual_loss': val_perceptual_loss.item(),
+                            }, step=global_step)
                         model.train()
 
             # Stop training if max steps is reached

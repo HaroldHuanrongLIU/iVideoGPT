@@ -615,6 +615,7 @@ def start_train():
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
     train_dataloader, eval_dataloader = get_dataloaders(args)
+    train_dataloader, eval_dataloader = accelerator.prepare(train_dataloader, eval_dataloader)
     tokenizer, vocab_size = get_tokenizer(args)
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if num_update_steps_per_epoch == 0:
@@ -717,15 +718,15 @@ def start_train():
     else:
         evaluator = None
 
-    # Prepare everything with our `accelerator`.
-    # we do not need to prepare train dataloader
+    # Prepare everything with our `accelerator`. The dataloaders were prepared
+    # before computing step counts so multi-process runs shard data correctly.
     if evaluator is not None:
-        model, tokenizer, optimizer, lr_scheduler, evaluator, eval_dataloader = accelerator.prepare(
-            model, tokenizer, optimizer, lr_scheduler, evaluator, eval_dataloader
+        model, tokenizer, optimizer, lr_scheduler, evaluator = accelerator.prepare(
+            model, tokenizer, optimizer, lr_scheduler, evaluator
         )
     else:
-        model, tokenizer, optimizer, lr_scheduler, eval_dataloader = accelerator.prepare(
-            model, tokenizer, optimizer, lr_scheduler, eval_dataloader
+        model, tokenizer, optimizer, lr_scheduler = accelerator.prepare(
+            model, tokenizer, optimizer, lr_scheduler
         )
 
     # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
@@ -747,7 +748,7 @@ def start_train():
     total_batch_size = args.per_device_train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataloader)}")
+    logger.info(f"  Num batches per process = {len(train_dataloader)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.per_device_train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")

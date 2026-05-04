@@ -162,6 +162,13 @@ Train the 256x256 tokenizer for one epoch and the transformer for three epochs:
 bash scripts/finetune/surgwmbench-anchor-256.sh
 ```
 
+For multi-GPU training, set the number of processes to the number of visible
+GPUs:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 NUM_PROCESSES=4 bash scripts/finetune/surgwmbench-anchor-256.sh
+```
+
 Evaluate a trained run against original 1920x1080 target frames:
 
 ```bash

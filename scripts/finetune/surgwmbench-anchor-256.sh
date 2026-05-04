@@ -6,6 +6,16 @@ AMUSED_VQVAE="${AMUSED_VQVAE:-pretrained_models/amused/vqvae}"
 OXE_TRANSFORMER="${OXE_TRANSFORMER:-pretrained_models/ivideogpt-oxe-256-act-free/transformer}"
 TOKENIZER_OUTPUT_ROOT="${TOKENIZER_OUTPUT_ROOT:-log_vqgan}"
 TRANSFORMER_OUTPUT_ROOT="${TRANSFORMER_OUTPUT_ROOT:-log_trm}"
+NUM_PROCESSES="${NUM_PROCESSES:-1}"
+GPU_IDS="${GPU_IDS:-}"
+
+ACCELERATE_ARGS=(--num_processes "${NUM_PROCESSES}")
+if [ "${NUM_PROCESSES}" -gt 1 ]; then
+  ACCELERATE_ARGS=(--multi_gpu "${ACCELERATE_ARGS[@]}")
+fi
+if [ -n "${GPU_IDS}" ]; then
+  ACCELERATE_ARGS+=(--gpu_ids "${GPU_IDS}")
+fi
 
 if [ ! -f "${AMUSED_VQVAE}/diffusion_pytorch_model.safetensors" ]; then
   mkdir -p pretrained_models/amused
@@ -20,7 +30,7 @@ if [ ! -f "${OXE_TRANSFORMER}/model.safetensors" ]; then
     --local-dir pretrained_models/ivideogpt-oxe-256-act-free
 fi
 
-accelerate launch train_tokenizer.py \
+accelerate launch "${ACCELERATE_ARGS[@]}" train_tokenizer.py \
   --exp_name surgwmbench_anchor_tokenizer_256 --output_dir "${TOKENIZER_OUTPUT_ROOT}" \
   --seed 0 --mixed_precision bf16 \
   --model_type ctx_vqgan \
@@ -34,7 +44,7 @@ accelerate launch train_tokenizer.py \
 
 TOKENIZER_DIR="${TOKENIZER_DIR:-$(ls -td "${TOKENIZER_OUTPUT_ROOT}"/*-surgwmbench_anchor_tokenizer_256 | head -n 1)}"
 
-accelerate launch train_gpt.py \
+accelerate launch "${ACCELERATE_ARGS[@]}" train_gpt.py \
   --exp_name surgwmbench_anchor_transformer_256 --output_dir "${TRANSFORMER_OUTPUT_ROOT}" \
   --seed 0 --mixed_precision bf16 \
   --vqgan_type ctx_vqgan \
