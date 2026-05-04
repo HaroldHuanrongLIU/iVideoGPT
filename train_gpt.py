@@ -36,12 +36,10 @@ from transformers import (
     SchedulerType,
     get_scheduler,
 )
-from transformers.utils import check_min_version, send_example_telemetry
-from transformers.utils.versions import require_version
+from transformers.utils import check_min_version
 
 from ivideogpt.vq_model import CompressiveVQModel
 from ivideogpt.transformer import HeadModelWithAction
-from ivideogpt.utils.video_metric import Evaluator, FeatureStats
 from ivideogpt.data import *
 from peft import LoraConfig, TaskType, get_peft_model
 
@@ -50,12 +48,33 @@ from peft import LoraConfig, TaskType, get_peft_model
 
 logger = get_logger(__name__)
 
-require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/language-modeling/requirements.txt")
-
 MODEL_CONFIG_CLASSES = list(MODEL_MAPPING.keys())
 
 
 def get_dataloaders(args):
+    if args.dataset_format == "surgwmbench_anchor":
+        if args.action_conditioned or args.goal_conditioned:
+            raise ValueError("SurgWMBench anchor video prediction is action-free and goal-free.")
+        train_dataloader = make_surgwmbench_anchor_dataloader(
+            dataset_root=args.surgwmbench_root,
+            manifest=args.surgwmbench_train_manifest,
+            batch_size=args.per_device_train_batch_size,
+            num_workers=args.dataloader_num_workers,
+            image_size=args.resolution,
+            max_samples=args.surgwmbench_max_train_samples,
+            shuffle=True,
+        )
+        eval_dataloader = make_surgwmbench_anchor_dataloader(
+            dataset_root=args.surgwmbench_root,
+            manifest=args.surgwmbench_val_manifest,
+            batch_size=args.per_device_eval_batch_size,
+            num_workers=args.dataloader_num_workers,
+            image_size=args.resolution,
+            max_samples=args.surgwmbench_max_val_samples,
+            shuffle=False,
+        )
+        return train_dataloader, eval_dataloader
+
     # DataLoaders creation:
     if args.strong_aug:
         augmentation_args = {
@@ -208,7 +227,7 @@ def parse_args():
                         help="Initial learning rate (after the potential warmup period) to use.")
     parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay to use.")
     parser.add_argument("--num_train_epochs", type=int, default=1, help="Total number of training epochs to perform.")
-    parser.add_argument("--max_train_steps", type=int, default=1000000,
+    parser.add_argument("--max_train_steps", type=int, default=None,
                         help="Total number of training steps to perform. If provided, overrides num_train_epochs.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
@@ -281,6 +300,13 @@ def parse_args():
     parser.add_argument('--strong_aug', default=False, action='store_true')
     parser.add_argument('--no_aug', default=False, action='store_true')
     parser.add_argument('--oxe_data_mixes_type', default='select', type=str)
+    parser.add_argument('--dataset_format', default='robotic', choices=['robotic', 'surgwmbench_anchor'])
+    parser.add_argument('--surgwmbench_root', default=DEFAULT_SURGWMBENCH_ROOT, type=str)
+    parser.add_argument('--surgwmbench_train_manifest', default='manifests/train.jsonl', type=str)
+    parser.add_argument('--surgwmbench_val_manifest', default='manifests/val.jsonl', type=str)
+    parser.add_argument('--surgwmbench_test_manifest', default='manifests/test.jsonl', type=str)
+    parser.add_argument('--surgwmbench_max_train_samples', default=None, type=int)
+    parser.add_argument('--surgwmbench_max_val_samples', default=None, type=int)
 
     parser.add_argument("--log_steps", type=int, default=100, help=("Print logs every X steps."))
     parser.add_argument("--validation_steps", type=int, default=5000)
@@ -323,7 +349,11 @@ def evaluate(args, accelerator, tokenizer, model, eval_dataloader, evaluator, co
     model.eval()
     losses = []
     mse_values, psnr_values, ssim_values, lpips_values, = [], [], [], []
-    real_feats, gen_feats = FeatureStats(capture_mean_cov=True), FeatureStats(capture_mean_cov=True)
+    if args.use_fvd:
+        from ivideogpt.utils.video_metric import FeatureStats
+        real_feats, gen_feats = FeatureStats(capture_mean_cov=True), FeatureStats(capture_mean_cov=True)
+    else:
+        real_feats, gen_feats = None, None
     eval_iters = min(len(eval_dataloader), args.max_eval_iters)
     bar = tqdm(range(eval_iters), desc="validation", disable=not accelerator.is_local_main_process)
 
@@ -580,6 +610,16 @@ def start_train():
     # download model & vocab.
     train_dataloader, eval_dataloader = get_dataloaders(args)
     tokenizer, vocab_size = get_tokenizer(args)
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if num_update_steps_per_epoch == 0:
+        raise ValueError("Training dataloader is empty.")
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    else:
+        args.num_train_epochs = max(
+            args.num_train_epochs,
+            math.ceil(args.max_train_steps / num_update_steps_per_epoch),
+        )
 
     if args.config_name:
         config = AutoConfig.from_pretrained(
@@ -665,13 +705,22 @@ def start_train():
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
 
-    evaluator = Evaluator(args.i3d_path, max_batchsize=args.max_decode_batchsize)
+    if args.use_fvd or args.use_frame_metrics:
+        from ivideogpt.utils.video_metric import Evaluator
+        evaluator = Evaluator(args.i3d_path, max_batchsize=args.max_decode_batchsize)
+    else:
+        evaluator = None
 
     # Prepare everything with our `accelerator`.
     # we do not need to prepare train dataloader
-    model, tokenizer, optimizer, lr_scheduler, evaluator, eval_dataloader = accelerator.prepare(
-        model, tokenizer, optimizer, lr_scheduler, evaluator, eval_dataloader
-    )
+    if evaluator is not None:
+        model, tokenizer, optimizer, lr_scheduler, evaluator, eval_dataloader = accelerator.prepare(
+            model, tokenizer, optimizer, lr_scheduler, evaluator, eval_dataloader
+        )
+    else:
+        model, tokenizer, optimizer, lr_scheduler, eval_dataloader = accelerator.prepare(
+            model, tokenizer, optimizer, lr_scheduler, eval_dataloader
+        )
 
     # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
     if accelerator.distributed_type == DistributedType.TPU:

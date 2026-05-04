@@ -3,6 +3,7 @@ import json
 import sys
 import os
 import cv2
+import math
 import time
 from pathlib import Path
 import psutil
@@ -160,7 +161,7 @@ def parse_args():
     parser.add_argument("--train_batch_size", type=int, default=16,
                         help="Batch size (per device) for the training dataloader.")
     parser.add_argument("--num_train_epochs", type=int, default=1)
-    parser.add_argument("--max_train_steps", type=int, default=1000000,
+    parser.add_argument("--max_train_steps", type=int, default=None,
                         help="Total number of training steps to perform.  If provided, overrides num_train_epochs.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
@@ -274,6 +275,13 @@ def parse_args():
     parser.add_argument('--balanced_loss', default=False, action='store_true')
     parser.add_argument('--selected_params', default=False, action='store_true')
     parser.add_argument('--no_aug', default=False, action='store_true')
+    parser.add_argument('--dataset_format', default='robotic', choices=['robotic', 'surgwmbench_anchor'])
+    parser.add_argument('--surgwmbench_root', default=DEFAULT_SURGWMBENCH_ROOT, type=str)
+    parser.add_argument('--surgwmbench_train_manifest', default='manifests/train.jsonl', type=str)
+    parser.add_argument('--surgwmbench_val_manifest', default='manifests/val.jsonl', type=str)
+    parser.add_argument('--surgwmbench_test_manifest', default='manifests/test.jsonl', type=str)
+    parser.add_argument('--surgwmbench_max_train_samples', default=None, type=int)
+    parser.add_argument('--surgwmbench_max_val_samples', default=None, type=int)
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -367,7 +375,7 @@ def main():
                 low_cpu_mem_usage=False, device_map=None,
                 ignore_mismatched_sizes=True
             )
-            if args.pretrained_model_name_or_path == "pretrained_models/amused/vqvae":
+            if args.pretrained_model_name_or_path.rstrip("/").endswith("pretrained_models/amused/vqvae"):
                 model.init_modules()
             if args.context_length != model.context_length:
                 print(
@@ -453,59 +461,92 @@ def main():
     if args.dataset_name != "robotic":
         raise NotImplementedError
 
-    # DataLoaders creation:
-    if args.strong_aug:
-        augmentation_args = {
-            'brightness': [0.6, 1.4],
-            'contrast': [0.6, 1.4],
-            'saturation': [0.6, 1.4],
-            'hue': [-0.5, 0.5],
-            'random_resized_crop_scale': (0.6, 1.0),
-            'random_resized_crop_ratio': (0.75, 1.3333),
-            'no_aug': args.no_aug,
-        }
+    if args.dataset_format == "surgwmbench_anchor":
+        train_dataloader = make_surgwmbench_anchor_dataloader(
+            dataset_root=args.surgwmbench_root,
+            manifest=args.surgwmbench_train_manifest,
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+            image_size=args.resolution,
+            max_samples=args.surgwmbench_max_train_samples,
+            shuffle=True,
+            drop_last=True,
+        )
+        eval_dataloader = make_surgwmbench_anchor_dataloader(
+            dataset_root=args.surgwmbench_root,
+            manifest=args.surgwmbench_val_manifest,
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+            image_size=args.resolution,
+            max_samples=args.surgwmbench_max_val_samples,
+            shuffle=False,
+            drop_last=True,
+        )
     else:
-        augmentation_args = {
-            'brightness': [0.9, 1.1],
-            'contrast': [0.9, 1.1],
-            'saturation': [0.9, 1.1],
-            'hue': [-0.05, 0.05],
-            'random_resized_crop_scale': (0.8, 1.0),
-            'random_resized_crop_ratio': (0.9, 1.1),
-            'no_aug': args.no_aug,
+        # DataLoaders creation:
+        if args.strong_aug:
+            augmentation_args = {
+                'brightness': [0.6, 1.4],
+                'contrast': [0.6, 1.4],
+                'saturation': [0.6, 1.4],
+                'hue': [-0.5, 0.5],
+                'random_resized_crop_scale': (0.6, 1.0),
+                'random_resized_crop_ratio': (0.75, 1.3333),
+                'no_aug': args.no_aug,
+            }
+        else:
+            augmentation_args = {
+                'brightness': [0.9, 1.1],
+                'contrast': [0.9, 1.1],
+                'saturation': [0.9, 1.1],
+                'hue': [-0.05, 0.05],
+                'random_resized_crop_scale': (0.8, 1.0),
+                'random_resized_crop_ratio': (0.9, 1.1),
+                'no_aug': args.no_aug,
+            }
+        segment_args = {
+            'random_selection': args.rand_select,
+            'random_shuffle': args.rand_shuffle,
+            'goal_conditioned': False,
+            'segment_length': args.segment_length,
+            'context_length': args.context_length,
+            'stepsize': args.video_stepsize,
+            'segment_horizon': args.segment_horizon,
         }
-    segment_args = {
-        'random_selection': args.rand_select,
-        'random_shuffle': args.rand_shuffle,
-        'goal_conditioned': False,
-        'segment_length': args.segment_length,
-        'context_length': args.context_length,
-        'stepsize': args.video_stepsize,
-        'segment_horizon': args.segment_horizon,
-    }
-    train_dataloader = SimpleRoboticDataLoaderv2(
-        parent_dir=args.dataset_path,
-        datasets=DATASET_NAMED_MIXES[args.oxe_data_mixes_type],
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-        train=True,
-        maxsize=args.dataset_size,
-        image_size=args.resolution,
-        sthsth_root_path=args.sthsth_root_path,
-        **augmentation_args,
-        **segment_args,
-    )
-    eval_dataloader = SimpleRoboticDataLoaderv2(
-        parent_dir=args.dataset_path,
-        datasets=DATASET_NAMED_MIXES[args.oxe_data_mixes_type],
-        batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
-        train=False,
-        image_size=args.resolution,
-        sthsth_root_path=args.sthsth_root_path,
-        **augmentation_args,
-        **segment_args,
-    )
+        train_dataloader = SimpleRoboticDataLoaderv2(
+            parent_dir=args.dataset_path,
+            datasets=DATASET_NAMED_MIXES[args.oxe_data_mixes_type],
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+            train=True,
+            maxsize=args.dataset_size,
+            image_size=args.resolution,
+            sthsth_root_path=args.sthsth_root_path,
+            **augmentation_args,
+            **segment_args,
+        )
+        eval_dataloader = SimpleRoboticDataLoaderv2(
+            parent_dir=args.dataset_path,
+            datasets=DATASET_NAMED_MIXES[args.oxe_data_mixes_type],
+            batch_size=args.train_batch_size,
+            num_workers=args.dataloader_num_workers,
+            train=False,
+            image_size=args.resolution,
+            sthsth_root_path=args.sthsth_root_path,
+            **augmentation_args,
+            **segment_args,
+        )
+
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if num_update_steps_per_epoch == 0:
+        raise ValueError("Training dataloader is empty.")
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    else:
+        args.num_train_epochs = max(
+            args.num_train_epochs,
+            math.ceil(args.max_train_steps / num_update_steps_per_epoch),
+        )
 
     lr_scheduler = get_scheduler(
         args.lr_scheduler,

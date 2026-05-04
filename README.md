@@ -143,6 +143,32 @@ bash ./scripts/evaluation/bair-64-act-cond.sh
 
 See more scripts for [released checkpoints](#-models) at [`scripts/evaluation`](/scripts/evaluation).
 
+## SurgWMBench 20-Anchor Prediction
+
+This fork adds a SurgWMBench sparse-anchor path for action-free video prediction. Each sample uses only the 20 human-labeled anchor frames from the official manifests. The model sees anchors 1-5 and predicts anchors 6-20; evaluation reports horizons 6-10, 6-15, and 6-20.
+
+Use the canonical local dataset root:
+
+```bash
+export SURGWMBENCH_ROOT=/mnt/hdd1/neurips2026_dataset_track/SurgWMBench
+```
+
+Train the 256x256 tokenizer for one epoch and the transformer for three epochs:
+
+```bash
+bash scripts/finetune/surgwmbench-anchor-256.sh
+```
+
+Evaluate a trained run against original 1920x1080 target frames:
+
+```bash
+export TOKENIZER_DIR=log_vqgan/<timestamp>-surgwmbench_anchor_tokenizer_256
+export TRANSFORMER_DIR=log_trm/<timestamp>-surgwmbench_anchor_transformer_256
+bash scripts/evaluation/surgwmbench-anchor-256.sh
+```
+
+The evaluation JSON is written to `benchmark/outputs/ivideogpt_surgwmbench_anchor_test/metrics.json`. Dense interpolation files are not used for this task; they remain auxiliary pseudo labels for separate trajectory work.
+
 ## 🤖 Visual Control
 
 ### Visual Model-based RL
