@@ -12,7 +12,7 @@ from benchmark.surgwmbench import BaselineSpec, run_cli
 
 def predict_native_ivideogpt_frames(
     dataset_root: Path,
-    context_frame_paths: Sequence[str],
+    window: object,
     args: argparse.Namespace,
 ) -> List[np.ndarray]:
     checkpoint = Path(str(args.checkpoint))
@@ -74,7 +74,7 @@ def predict_native_ivideogpt_frames(
 
     native_resolution = int(getattr(tokenizer, "config", {}).get("resolution", args.image_size))
     context_frames: List[np.ndarray] = []
-    for frame_path in context_frame_paths[: int(args.context_frames)]:
+    for frame_path in window.context_frame_paths[: int(args.context_frames)]:
         with Image.open(dataset_root / frame_path) as image:
             image = image.convert("RGB").resize((native_resolution, native_resolution))
             context_frames.append(np.asarray(image, dtype=np.uint8))
