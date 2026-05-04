@@ -174,6 +174,10 @@ class SimpleRoboticDatasetv2(data.Dataset):
                 parent_dir = yaml.load(open('DATASET.yaml'), Loader=yaml.FullLoader)['robonet_test_dataset']
             self.filenames = glob.glob(os.path.join(parent_dir, '*.npz'))
             self.filenames.sort()
+        elif dataset_name == 'surgwmbench':
+            split = 'train' if train else 'validation'
+            self.filenames = glob.glob(os.path.join(parent_dir, split, '*.npz'))
+            self.filenames.sort()
         else:
             self.filenames = glob.glob(os.path.join(parent_dir, dataset_name, '*.npz'))
             self.filenames.sort()

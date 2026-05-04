@@ -665,16 +665,24 @@ def start_train():
         num_training_steps=args.max_train_steps * accelerator.num_processes,
     )
 
-    evaluator = Evaluator(args.i3d_path, max_batchsize=args.max_decode_batchsize)
+    evaluator = Evaluator(args.i3d_path, max_batchsize=args.max_decode_batchsize) if (
+        args.use_fvd or args.use_frame_metrics
+    ) else None
 
     # Prepare everything with our `accelerator`.
     # we do not need to prepare train dataloader
-    model, tokenizer, optimizer, lr_scheduler, evaluator, eval_dataloader = accelerator.prepare(
-        model, tokenizer, optimizer, lr_scheduler, evaluator, eval_dataloader
-    )
+    if evaluator is None:
+        model, tokenizer, optimizer, lr_scheduler, eval_dataloader = accelerator.prepare(
+            model, tokenizer, optimizer, lr_scheduler, eval_dataloader
+        )
+    else:
+        model, tokenizer, optimizer, lr_scheduler, evaluator, eval_dataloader = accelerator.prepare(
+            model, tokenizer, optimizer, lr_scheduler, evaluator, eval_dataloader
+        )
 
     # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
-    if accelerator.distributed_type == DistributedType.TPU:
+    tpu_distributed_type = getattr(DistributedType, "TPU", None)
+    if tpu_distributed_type is not None and accelerator.distributed_type == tpu_distributed_type:
         model.tie_weights()
 
     # Figure out how many steps we should save the Accelerator states

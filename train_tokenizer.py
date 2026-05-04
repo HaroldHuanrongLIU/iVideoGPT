@@ -393,8 +393,9 @@ def main():
         discriminator = Discriminator(depth=args.disc_depth)
         discriminator.load_state_dict(torch.load(args.discriminator_config_name_or_path))
 
-    # Perceptual loss
-    lpips = LPIPS().to(accelerator.device).eval()
+    # Perceptual loss. SurgWMBench smoke runs can set --perc_weight 0 to avoid
+    # downloading LPIPS/VGG assets while still exercising native GPU training.
+    lpips = None if args.perc_weight == 0 else LPIPS().to(accelerator.device).eval()
     # Enable flash attention if asked
     if args.enable_xformers_memory_efficient_attention:
         model.enable_xformers_memory_efficient_attention()
@@ -669,27 +670,33 @@ def main():
                         avg_ref_recon_loss = avg_loss(ref_recon_loss)
 
                     # perceptual loss. The high level feature mean squared error loss
-                    perceptual_loss = lpips(
-                        pixel_values.contiguous() * 2 - 1.0,
-                        fmap.contiguous() * 2 - 1.0,
-                        weight=weights
-                    ).mean()
-                    if args.balanced_loss:
-                        loss += args.perc_weight * perceptual_loss * \
-                            (args.segment_length - args.context_length) / args.segment_length
+                    if lpips is None:
+                        perceptual_loss = recon_loss.new_zeros(())
                     else:
-                        loss += args.perc_weight * perceptual_loss
-                    avg_perceptual_loss = avg_loss(perceptual_loss)
-                    if 'ctx' in args.model_type:
-                        ref_perceptual_loss = lpips(
-                            reference_single.contiguous() * 2 - 1.0,
-                            fmap_ref.contiguous() * 2 - 1.0,
+                        perceptual_loss = lpips(
+                            pixel_values.contiguous() * 2 - 1.0,
+                            fmap.contiguous() * 2 - 1.0,
                             weight=weights
                         ).mean()
                         if args.balanced_loss:
-                            loss += args.perc_weight * ref_perceptual_loss * args.context_length / args.segment_length
+                            loss += args.perc_weight * perceptual_loss * \
+                                (args.segment_length - args.context_length) / args.segment_length
                         else:
-                            loss += args.perc_weight * ref_perceptual_loss
+                            loss += args.perc_weight * perceptual_loss
+                    avg_perceptual_loss = avg_loss(perceptual_loss)
+                    if 'ctx' in args.model_type:
+                        if lpips is None:
+                            ref_perceptual_loss = ref_recon_loss.new_zeros(())
+                        else:
+                            ref_perceptual_loss = lpips(
+                                reference_single.contiguous() * 2 - 1.0,
+                                fmap_ref.contiguous() * 2 - 1.0,
+                                weight=weights
+                            ).mean()
+                            if args.balanced_loss:
+                                loss += args.perc_weight * ref_perceptual_loss * args.context_length / args.segment_length
+                            else:
+                                loss += args.perc_weight * ref_perceptual_loss
                         avg_ref_perceptual_loss = avg_loss(ref_perceptual_loss)
 
                     # generator loss
@@ -953,11 +960,14 @@ def main():
                                 fmap, commit_loss = model(pixel_values, return_dict=False, return_loss=True)
 
                             recon_loss = get_recon_loss(pixel_values, fmap, weights)
-                            perceptual_loss = lpips(
-                                pixel_values.contiguous() * 2 - 1.0,
-                                fmap.contiguous() * 2 - 1.0,
-                                weight=weights
-                            ).mean()
+                            if lpips is None:
+                                perceptual_loss = recon_loss.new_zeros(())
+                            else:
+                                perceptual_loss = lpips(
+                                    pixel_values.contiguous() * 2 - 1.0,
+                                    fmap.contiguous() * 2 - 1.0,
+                                    weight=weights
+                                ).mean()
                             recon_losses.append(recon_loss)
                             perceptual_losses.append(perceptual_loss)
 

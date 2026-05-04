@@ -179,6 +179,7 @@ OXE_SELECT_STHSTH = [(x, y * 0.85) for x, y in OXE_SELECT] + [("sthsth", 0.15)]
 
 DATASET_NAMED_MIXES = {
     # "bridge": BRIDGE_MIX,
+    "surgwmbench": [("surgwmbench", 1.0)],
     "frac": [("fractal20220817_data", 1.0)],
     "robonet": [("robo_net", 1.0)],
     "tfds_robonet": [("tfds_robonet", 1.0)],
