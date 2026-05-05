@@ -40,6 +40,13 @@ def parse_args():
     parser.add_argument("--do_sample", action="store_true")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=100)
+    parser.add_argument(
+        "--metric_resolution",
+        choices=["original", "model"],
+        default="original",
+        help="'original': resize predictions to original frame size and score there. "
+             "'model': downsample GT to model resolution and score there (no upsample).",
+    )
     return parser.parse_args()
 
 
@@ -60,6 +67,15 @@ def resize_prediction_to_original(prediction: torch.Tensor, original: torch.Tens
     return F.resize(
         prediction,
         [height, width],
+        interpolation=InterpolationMode.BICUBIC,
+        antialias=True,
+    ).clamp(0.0, 1.0)
+
+
+def downsample_gt_to_model_resolution(gt: torch.Tensor, resolution: int) -> torch.Tensor:
+    return F.resize(
+        gt,
+        [resolution, resolution],
         interpolation=InterpolationMode.BICUBIC,
         antialias=True,
     ).clamp(0.0, 1.0)
@@ -165,8 +181,13 @@ def main():
         for target_offset in range(args.segment_length - args.context_length):
             anchor_idx = args.context_length + target_offset
             gt = load_original_frame(dataset_root, metadata["anchor_frame_paths"][anchor_idx]).to(device)
-            pred = resize_prediction_to_original(prediction[0, anchor_idx].to(device), gt)
-            gt_batch = gt.unsqueeze(0)
+            if args.metric_resolution == "original":
+                pred = resize_prediction_to_original(prediction[0, anchor_idx].to(device), gt)
+                gt_for_metric = gt
+            else:
+                pred = prediction[0, anchor_idx].to(device).clamp(0.0, 1.0)
+                gt_for_metric = downsample_gt_to_model_resolution(gt, args.resolution)
+            gt_batch = gt_for_metric.unsqueeze(0)
             pred_batch = pred.unsqueeze(0)
             mse = mse_loss(pred_batch, gt_batch).item()
             psnr = psnr_metric(pred_batch, gt_batch).mean().item()
@@ -216,7 +237,12 @@ def main():
             "horizon_10": "anchors 6-15",
             "horizon_15": "anchors 6-20",
         },
-        "resize_policy": "full-frame bicubic resize to model resolution; predictions bicubic-resized back to original frame size for metrics",
+        "metric_resolution": args.metric_resolution,
+        "resize_policy": (
+            "full-frame bicubic resize to model resolution; predictions bicubic-resized back to original frame size for metrics"
+            if args.metric_resolution == "original"
+            else f"full-frame bicubic resize to model resolution; GT bicubic-downsampled to {args.resolution}x{args.resolution} for metrics (predictions kept at model resolution)"
+        ),
         "num_clips": len(dataset),
         "metrics": {name: summarize(records) for name, records in records_by_horizon.items()},
         "sample_artifacts": sample_artifacts,
