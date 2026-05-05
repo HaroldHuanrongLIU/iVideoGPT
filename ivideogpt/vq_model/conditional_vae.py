@@ -32,7 +32,19 @@ class CrossAttentionBlock(nn.Module):
         self.act = get_activation(act_fn)
 
     def set_kv_frames(self, kv_frames):
-        self.kv_pos_emb.data = self.kv_pos_emb.data[-kv_frames * self.kv_pos_emb.shape[0] // self.kv_frames:]
+        if kv_frames == self.kv_frames:
+            return
+        per_frame = self.kv_pos_emb.shape[0] // self.kv_frames
+        new_size = kv_frames * per_frame
+        if kv_frames < self.kv_frames:
+            new_data = self.kv_pos_emb.data[-new_size:].clone()
+        else:
+            channels = self.kv_pos_emb.shape[1]
+            new_data = torch.zeros(new_size, channels,
+                                   device=self.kv_pos_emb.device,
+                                   dtype=self.kv_pos_emb.dtype)
+            new_data[-self.kv_pos_emb.shape[0]:] = self.kv_pos_emb.data
+        self.kv_pos_emb = nn.parameter.Parameter(new_data, requires_grad=True)
         self.kv_frames = kv_frames
 
     def forward(self, z, addin):
