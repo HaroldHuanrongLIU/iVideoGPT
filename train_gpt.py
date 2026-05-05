@@ -44,6 +44,8 @@ from peft import LoraConfig, TaskType, get_peft_model
 
 try:
     import datasets
+    if not hasattr(datasets, "utils"):
+        datasets = None
 except ImportError:
     datasets = None
 
@@ -523,8 +525,9 @@ def evaluate(args, accelerator, tokenizer, model, eval_dataloader, evaluator, co
         eval_logs = {
             'eval/eval_loss': eval_loss,
             'eval/perplexity': perplexity,
-            'eval/mse': torch.cat(mse_values, 0).mean().item(),
         }
+        if len(mse_values) > 0:
+            eval_logs['eval/mse'] = torch.cat(mse_values, 0).mean().item()
 
         if args.use_fvd:
             fvd = accelerator.unwrap_model(evaluator).compute_fvd(real_feats, gen_feats)
@@ -657,10 +660,18 @@ def start_train():
 
     if args.pretrained_transformer_path is not None:
         state_dict = load_file(os.path.join(args.pretrained_transformer_path, 'model.safetensors'))
-        if args.load_internal_llm:
-            model.llm.load_state_dict(state_dict, strict=True)
+        target = model.llm if args.load_internal_llm else model
+        target_state = target.state_dict()
+        skipped = [k for k, v in state_dict.items()
+                   if k in target_state and target_state[k].shape != v.shape]
+        if skipped:
+            for k in skipped:
+                del state_dict[k]
+            logger.info(f"Skipping shape-mismatched keys from pretrained checkpoint: {skipped}")
+            missing, unexpected = target.load_state_dict(state_dict, strict=False)
+            logger.info(f"load_state_dict (non-strict): missing={missing}, unexpected={unexpected}")
         else:
-            model.load_state_dict(state_dict, strict=True)
+            target.load_state_dict(state_dict, strict=True)
         logger.info("Finetuning the model from " + args.pretrained_transformer_path)
     else:
         logger.info("Training new model from scratch")
@@ -730,7 +741,7 @@ def start_train():
         )
 
     # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
-    if accelerator.distributed_type == DistributedType.TPU:
+    if accelerator.distributed_type == DistributedType.XLA:
         model.tie_weights()
 
     # Figure out how many steps we should save the Accelerator states
@@ -911,7 +922,11 @@ def start_train():
         accelerator.end_training()
 
     if args.output_dir is not None:
-        accelerator.wait_for_everyone()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            try:
+                accelerator.wait_for_everyone()
+            except Exception as e:
+                logger.warning(f"wait_for_everyone failed before save: {e}")
         unwrapped_model = accelerator.unwrap_model(model)
         unwrapped_model.save_pretrained(
             args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save

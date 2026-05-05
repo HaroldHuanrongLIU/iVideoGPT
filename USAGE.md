@@ -125,13 +125,13 @@ Then run transformer finetuning:
 ```bash
 export TOKENIZER_DIR=log_vqgan/<timestamp>-surgwmbench_anchor_tokenizer_256
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -m accelerate.commands.launch \
-  --multi_gpu --num_processes 4 \
+CUDA_VISIBLE_DEVICES=0,1,2 .venv/bin/python -m accelerate.commands.launch \
+  --multi_gpu --num_processes 3 \
   train_gpt.py \
   --exp_name surgwmbench_anchor_transformer_256 --output_dir log_trm \
   --seed 0 --mixed_precision bf16 \
   --vqgan_type ctx_vqgan \
-  --pretrained_model_name_or_path "${TOKENIZER_DIR}" \
+  --pretrained_model_name_or_path log_vqgan/2026-05-05-08:13:55-surgwmbench_anchor_tokenizer_256\
   --config_name configs/llama/config_surgwm_anchor.json \
   --pretrained_transformer_path pretrained_models/ivideogpt-oxe-256-act-free/transformer \
   --per_device_train_batch_size 1 --gradient_accumulation_steps 4 \
