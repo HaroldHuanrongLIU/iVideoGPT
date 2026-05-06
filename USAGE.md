@@ -32,7 +32,9 @@ export SURGWMBENCH_ROOT=/mnt/hdd1/neurips2026_dataset_track/SurgWMBench
 ```
 
 The SurgWMBench path uses official sparse 20-anchor manifests. Training uses the
-first 5 anchors as context and predicts anchors 6-20.
+first 5 anchors as context and predicts anchors 6-20. Transformer finetuning can
+jointly train image tokens and future anchor trajectories with
+`--use_trajectory_head`.
 
 ## Checkpoint Inputs
 
@@ -93,10 +95,14 @@ CUDA_VISIBLE_DEVICES=0 python -m accelerate.commands.launch \
   --dataset_format surgwmbench_anchor --surgwmbench_root "${SURGWMBENCH_ROOT}" \
   --resolution 256 --dataloader_num_workers 4 \
   --segment_length 20 --context_length 5 \
+  --use_trajectory_head \
   --weight_decay 0.01 --llama_attn_drop 0.1 --embed_no_wd \
   --num_train_epochs 3 --validation_steps 500 --checkpointing_steps 1000 \
   --max_decode_batchsize 1
 ```
+
+The transformer checkpoint will include `trajectory_head.pt` and
+`trajectory_head_config.json` when `--use_trajectory_head` is enabled.
 
 ## Multi-GPU Training
 
@@ -131,7 +137,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 .venv/bin/python -m accelerate.commands.launch \
   --exp_name surgwmbench_anchor_transformer_256 --output_dir log_trm \
   --seed 0 --mixed_precision bf16 \
   --vqgan_type ctx_vqgan \
-  --pretrained_model_name_or_path log_vqgan/2026-05-05-08:13:55-surgwmbench_anchor_tokenizer_256\
+  --pretrained_model_name_or_path "${TOKENIZER_DIR}" \
   --config_name configs/llama/config_surgwm_anchor.json \
   --pretrained_transformer_path pretrained_models/ivideogpt-oxe-256-act-free/transformer \
   --per_device_train_batch_size 1 --gradient_accumulation_steps 4 \
@@ -139,6 +145,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 .venv/bin/python -m accelerate.commands.launch \
   --dataset_format surgwmbench_anchor --surgwmbench_root "${SURGWMBENCH_ROOT}" \
   --resolution 256 --dataloader_num_workers 4 \
   --segment_length 20 --context_length 5 \
+  --use_trajectory_head \
   --weight_decay 0.01 --llama_attn_drop 0.1 --embed_no_wd \
   --num_train_epochs 3 --validation_steps 500 --checkpointing_steps 1000 \
   --max_decode_batchsize 1
@@ -151,8 +158,9 @@ batch size 1 per GPU with gradient accumulation 4.
 
 Point `TOKENIZER_DIR` and `TRANSFORMER_DIR` to the trained checkpoint
 directories. Evaluation predicts anchors 6-10, 6-15, and 6-20 from the first 5
-anchors, resizes predictions back to each frame's original resolution, and
-computes image metrics against the original target frames.
+anchors, resizes predictions back to each frame's original resolution, computes
+image metrics against the original target frames, and reports trajectory ADE/FDE
+for anchors 6-10, 6-15, and 6-20 when `--use_trajectory_head` is set.
 
 ```bash
 export TOKENIZER_DIR=log_vqgan/<timestamp>-surgwmbench_anchor_tokenizer_256
@@ -164,6 +172,7 @@ python tools/evaluate_surgwmbench_anchor_prediction.py \
   --manifest manifests/test.jsonl \
   --tokenizer_path "${TOKENIZER_DIR}" \
   --transformer_path "${TRANSFORMER_DIR}" \
+  --use_trajectory_head \
   --output_dir "${OUTPUT_DIR}" \
   --resolution 256 \
   --context_length 5 \
@@ -175,6 +184,12 @@ The main metrics file is:
 
 ```text
 benchmark/outputs/ivideogpt_surgwmbench_anchor_test/metrics.json
+```
+
+Joint trajectory evaluation also writes:
+
+```text
+benchmark/outputs/ivideogpt_surgwmbench_anchor_test/predictions.jsonl
 ```
 
 Visual samples, when enabled, are written under:
@@ -191,6 +206,7 @@ python tools/evaluate_surgwmbench_anchor_prediction.py \
   --manifest manifests/test.jsonl \
   --tokenizer_path "${TOKENIZER_DIR}" \
   --transformer_path "${TRANSFORMER_DIR}" \
+  --use_trajectory_head \
   --output_dir "${OUTPUT_DIR}" \
   --resolution 256 \
   --context_length 5 \

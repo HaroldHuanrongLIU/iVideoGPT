@@ -84,10 +84,15 @@ def test_surgwmbench_anchor_dataset_loads_20_anchor_frames(tmp_path):
         manifest="manifests/train.jsonl",
         image_size=16,
         return_metadata=True,
+        return_trajectory=True,
     )
     sample = dataset[0]
 
     assert sample["pixel_values"].shape == (20, 3, 16, 16)
+    assert sample["trajectory_norm"].shape == (20, 2)
+    assert sample["trajectory_px"].shape == (20, 2)
+    assert sample["trajectory_norm"][0].tolist() == pytest.approx([0.1, 0.2])
+    assert sample["trajectory_px"][3].tolist() == [3.0, 4.0]
     assert sample["metadata"]["sampled_indices"] == list(range(20))
     assert sample["metadata"]["anchor_frame_paths"][0].endswith("000000.png")
 

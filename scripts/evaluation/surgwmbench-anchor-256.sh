@@ -11,6 +11,7 @@ python tools/evaluate_surgwmbench_anchor_prediction.py \
   --manifest manifests/test.jsonl \
   --tokenizer_path "${TOKENIZER_DIR}" \
   --transformer_path "${TRANSFORMER_DIR}" \
+  --use_trajectory_head \
   --output_dir "${OUTPUT_DIR}" \
   --resolution 256 \
   --context_length 5 \

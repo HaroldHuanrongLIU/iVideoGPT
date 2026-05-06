@@ -56,6 +56,7 @@ accelerate launch "${ACCELERATE_ARGS[@]}" train_gpt.py \
   --dataset_format surgwmbench_anchor --surgwmbench_root "${SURGWMBENCH_ROOT}" \
   --resolution 256 --dataloader_num_workers 4 \
   --segment_length 20 --context_length 5 \
+  --use_trajectory_head \
   --weight_decay 0.01 --llama_attn_drop 0.1 --embed_no_wd \
   --num_train_epochs 3 --validation_steps 500 --checkpointing_steps 1000 \
   --max_decode_batchsize 1

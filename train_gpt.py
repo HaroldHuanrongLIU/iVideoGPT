@@ -38,7 +38,12 @@ from transformers import (
 from transformers.utils import check_min_version
 
 from ivideogpt.vq_model import CompressiveVQModel
-from ivideogpt.transformer import HeadModelWithAction
+from ivideogpt.transformer import (
+    HeadModelWithAction,
+    SurgWMTrajectoryHead,
+    load_trajectory_head,
+    save_trajectory_head,
+)
 from ivideogpt.data import *
 from peft import LoraConfig, TaskType, get_peft_model
 
@@ -69,6 +74,7 @@ def get_dataloaders(args):
             image_size=args.resolution,
             max_samples=args.surgwmbench_max_train_samples,
             shuffle=True,
+            return_trajectory=args.use_trajectory_head,
         )
         eval_dataloader = make_surgwmbench_anchor_dataloader(
             dataset_root=args.surgwmbench_root,
@@ -78,6 +84,7 @@ def get_dataloaders(args):
             image_size=args.resolution,
             max_samples=args.surgwmbench_max_val_samples,
             shuffle=False,
+            return_trajectory=args.use_trajectory_head,
         )
         return train_dataloader, eval_dataloader
 
@@ -172,6 +179,30 @@ def get_tokenizer(args):
     else:
         raise NotImplementedError
     return vq_model, vocab_size
+
+
+def unpack_training_batch(batch, args, device):
+    actions = None
+    trajectory_norm = None
+    if isinstance(batch, dict):
+        pixel_values = batch["pixel_values"].to(device, non_blocking=True)
+        if "trajectory_norm" in batch:
+            trajectory_norm = batch["trajectory_norm"].to(device, non_blocking=True)
+        return pixel_values, actions, trajectory_norm
+
+    if args.action_conditioned:
+        pixel_values, actions = batch
+        actions = actions.to(device, non_blocking=True)
+        pixel_values = pixel_values.to(device, non_blocking=True)
+    else:
+        pixel_values = batch.to(device, non_blocking=True)
+    return pixel_values, actions, trajectory_norm
+
+
+def split_context_future_trajectory(trajectory_norm, context_length):
+    if trajectory_norm is None:
+        raise ValueError("--use_trajectory_head requires batches with trajectory_norm.")
+    return trajectory_norm[:, :context_length], trajectory_norm[:, context_length:]
 
 
 def generate_multiple_times(
@@ -313,6 +344,10 @@ def parse_args():
     parser.add_argument('--surgwmbench_test_manifest', default='manifests/test.jsonl', type=str)
     parser.add_argument('--surgwmbench_max_train_samples', default=None, type=int)
     parser.add_argument('--surgwmbench_max_val_samples', default=None, type=int)
+    parser.add_argument('--use_trajectory_head', default=False, action='store_true')
+    parser.add_argument('--trajectory_head_path', default=None, type=str)
+    parser.add_argument('--trajectory_loss_weight', default=1.0, type=float)
+    parser.add_argument('--trajectory_velocity_loss_weight', default=0.1, type=float)
 
     parser.add_argument("--log_steps", type=int, default=100, help=("Print logs every X steps."))
     parser.add_argument("--validation_steps", type=int, default=5000)
@@ -346,14 +381,23 @@ def parse_args():
 
     assert not (args.action_conditioned and not args.special_token), \
         "Action conditioned model must have special token enabled."
+    if args.use_trajectory_head and args.dataset_format != "surgwmbench_anchor":
+        raise ValueError("--use_trajectory_head is only implemented for --dataset_format surgwmbench_anchor.")
+    if args.use_trajectory_head and args.action_conditioned:
+        raise ValueError("--use_trajectory_head is action-free and cannot be combined with --action_conditioned.")
 
     return args
 
 
 @torch.no_grad
-def evaluate(args, accelerator, tokenizer, model, eval_dataloader, evaluator, completed_steps):
+def evaluate(args, accelerator, tokenizer, model, eval_dataloader, evaluator, completed_steps, trajectory_head=None):
     model.eval()
+    if trajectory_head is not None:
+        trajectory_head.eval()
     losses = []
+    trajectory_losses = []
+    trajectory_velocity_losses = []
+    trajectory_total_losses = []
     mse_values, psnr_values, ssim_values, lpips_values, = [], [], [], []
     if args.use_fvd:
         from ivideogpt.utils.video_metric import FeatureStats
@@ -366,12 +410,7 @@ def evaluate(args, accelerator, tokenizer, model, eval_dataloader, evaluator, co
     for i, batch in enumerate(eval_dataloader):
         if i == args.max_eval_iters:
             break
-        if args.action_conditioned:
-            pixel_values, actions = batch
-            actions = actions.to(accelerator.device, non_blocking=True)
-            pixel_values = pixel_values.to(accelerator.device, non_blocking=True)
-        else:
-            pixel_values = batch.to(accelerator.device, non_blocking=True)
+        pixel_values, actions, trajectory_norm = unpack_training_batch(batch, args, accelerator.device)
         batch_size = pixel_values.shape[0]
 
         if args.use_fvd:
@@ -397,7 +436,28 @@ def evaluate(args, accelerator, tokenizer, model, eval_dataloader, evaluator, co
         if args.action_conditioned:
             model_input['action'] = actions
 
-        if args.reward_prediction:
+        if args.use_trajectory_head:
+            context_trajectory_norm, future_trajectory_norm = split_context_future_trajectory(
+                trajectory_norm,
+                args.context_length,
+            )
+            trajectory_outputs = trajectory_head(
+                model,
+                input_ids=tokens,
+                labels=labels,
+                context_trajectory_norm=context_trajectory_norm,
+                future_trajectory_norm=future_trajectory_norm,
+            )
+            outputs = trajectory_outputs.base_outputs
+            total_loss = (
+                trajectory_outputs.image_loss
+                + args.trajectory_loss_weight * trajectory_outputs.trajectory_loss
+                + args.trajectory_velocity_loss_weight * trajectory_outputs.velocity_loss
+            )
+            trajectory_losses.append(accelerator.gather(trajectory_outputs.trajectory_loss.repeat(batch_size)))
+            trajectory_velocity_losses.append(accelerator.gather(trajectory_outputs.velocity_loss.repeat(batch_size)))
+            trajectory_total_losses.append(accelerator.gather(total_loss.repeat(batch_size)))
+        elif args.reward_prediction:
             if accelerator.num_processes > 1:
                 outputs, rewards = model.module(**model_input)
             else:
@@ -428,7 +488,17 @@ def evaluate(args, accelerator, tokenizer, model, eval_dataloader, evaluator, co
             #     max_new_tokens=max_new_tokens,
             #     **({'action': actions} if args.action_conditioned else {})
             # )
-            if args.reward_prediction:
+            if args.use_trajectory_head:
+                generated_tokens = accelerator.unwrap_model(trajectory_head).generate_tokens(
+                    accelerator.unwrap_model(model),
+                    gen_input.repeat(args.eval_generate_times, 1),
+                    context_trajectory_norm.repeat(args.eval_generate_times, 1, 1),
+                    do_sample=True,
+                    temperature=1.0,
+                    top_k=100,
+                    max_new_tokens=max_new_tokens,
+                )
+            elif args.reward_prediction:
                 generated_tokens, rewards = generate_multiple_times(
                     args.eval_generate_times,
                     accelerator, model, gen_input, actions if args.action_conditioned else None,
@@ -526,6 +596,12 @@ def evaluate(args, accelerator, tokenizer, model, eval_dataloader, evaluator, co
             'eval/eval_loss': eval_loss,
             'eval/perplexity': perplexity,
         }
+        if len(trajectory_losses) > 0:
+            eval_logs.update({
+                'eval/trajectory_loss': torch.cat(trajectory_losses, 0).mean().item(),
+                'eval/trajectory_velocity_loss': torch.cat(trajectory_velocity_losses, 0).mean().item(),
+                'eval/trajectory_total_loss': torch.cat(trajectory_total_losses, 0).mean().item(),
+            })
         if len(mse_values) > 0:
             eval_logs['eval/mse'] = torch.cat(mse_values, 0).mean().item()
 
@@ -542,6 +618,8 @@ def evaluate(args, accelerator, tokenizer, model, eval_dataloader, evaluator, co
         accelerator.log(eval_logs, step=completed_steps)
 
     model.train()
+    if trajectory_head is not None:
+        trajectory_head.train()
 
     if accelerator.is_main_process:
         return eval_logs
@@ -690,6 +768,19 @@ def start_train():
         else:
             model = get_peft_model(model, peft_config)
 
+    trajectory_head = None
+    if args.use_trajectory_head:
+        if args.trajectory_head_path is not None:
+            trajectory_head = load_trajectory_head(args.trajectory_head_path)
+            logger.info("Loaded trajectory head from " + args.trajectory_head_path)
+        else:
+            trajectory_head = SurgWMTrajectoryHead(
+                hidden_size=config.hidden_size,
+                context_length=args.context_length,
+                segment_length=args.segment_length,
+            )
+            logger.info("Initialized new SurgWMBench trajectory head")
+
     # Optimizer
     # Split weights in two groups, one with weight decay and the other not.
     # no_decay = ["bias", "layer_norm.weight"]
@@ -705,14 +796,29 @@ def start_train():
                     no_decay.append(fpn)
     optimizer_grouped_parameters = [
         {
-            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "params": [
+                p for n, p in model.named_parameters()
+                if p.requires_grad and not any(nd in n for nd in no_decay)
+            ],
             "weight_decay": args.weight_decay,
         },
         {
-            "params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)],
+            "params": [
+                p for n, p in model.named_parameters()
+                if p.requires_grad and any(nd in n for nd in no_decay)
+            ],
             "weight_decay": 0.0,
         },
     ]
+    if trajectory_head is not None:
+        optimizer_grouped_parameters[0]["params"].extend(
+            p for n, p in trajectory_head.named_parameters()
+            if p.requires_grad and not n.endswith("bias")
+        )
+        optimizer_grouped_parameters[1]["params"].extend(
+            p for n, p in trajectory_head.named_parameters()
+            if p.requires_grad and n.endswith("bias")
+        )
     optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
     # Scheduler and math around the number of training steps.
@@ -732,13 +838,23 @@ def start_train():
     # Prepare everything with our `accelerator`. The dataloaders were prepared
     # before computing step counts so multi-process runs shard data correctly.
     if evaluator is not None:
-        model, tokenizer, optimizer, lr_scheduler, evaluator = accelerator.prepare(
-            model, tokenizer, optimizer, lr_scheduler, evaluator
-        )
+        if trajectory_head is not None:
+            model, tokenizer, trajectory_head, optimizer, lr_scheduler, evaluator = accelerator.prepare(
+                model, tokenizer, trajectory_head, optimizer, lr_scheduler, evaluator
+            )
+        else:
+            model, tokenizer, optimizer, lr_scheduler, evaluator = accelerator.prepare(
+                model, tokenizer, optimizer, lr_scheduler, evaluator
+            )
     else:
-        model, tokenizer, optimizer, lr_scheduler = accelerator.prepare(
-            model, tokenizer, optimizer, lr_scheduler
-        )
+        if trajectory_head is not None:
+            model, tokenizer, trajectory_head, optimizer, lr_scheduler = accelerator.prepare(
+                model, tokenizer, trajectory_head, optimizer, lr_scheduler
+            )
+        else:
+            model, tokenizer, optimizer, lr_scheduler = accelerator.prepare(
+                model, tokenizer, optimizer, lr_scheduler
+            )
 
     # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
     if accelerator.distributed_type == DistributedType.XLA:
@@ -814,7 +930,16 @@ def start_train():
     avg_loss = None
 
     if args.eval_only:
-        eval_logs = evaluate(args, accelerator, tokenizer, model, eval_dataloader, evaluator, completed_steps)
+        eval_logs = evaluate(
+            args,
+            accelerator,
+            tokenizer,
+            model,
+            eval_dataloader,
+            evaluator,
+            completed_steps,
+            trajectory_head=trajectory_head,
+        )
         if eval_logs is not None:
             print(args.pretrained_model_name_or_path)
             print(args.pretrained_transformer_path)
@@ -823,6 +948,8 @@ def start_train():
 
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
+        if trajectory_head is not None:
+            trajectory_head.train()
         if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
             # We skip the first `n` batches in the dataloader when resuming from a checkpoint
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
@@ -831,12 +958,8 @@ def start_train():
             active_dataloader = train_dataloader
 
         for step, batch in enumerate(active_dataloader):
-            if args.action_conditioned:
-                pixel_values, actions = batch
-                actions = actions.to(accelerator.device, non_blocking=True)
-                pixel_values = pixel_values.to(accelerator.device, non_blocking=True)
-            else:
-                pixel_values = batch.to(accelerator.device, non_blocking=True)
+            pixel_values, actions, trajectory_norm = unpack_training_batch(batch, args, accelerator.device)
+            batch_size = pixel_values.shape[0]
 
             optimizer.zero_grad()
 
@@ -852,20 +975,52 @@ def start_train():
                 if args.action_conditioned:
                     model_input['action'] = actions
 
-            with accelerator.accumulate(model):
-                if args.reward_prediction:
+            accumulate_models = (model, trajectory_head) if trajectory_head is not None else (model,)
+            with accelerator.accumulate(*accumulate_models):
+                if args.use_trajectory_head:
+                    context_trajectory_norm, future_trajectory_norm = split_context_future_trajectory(
+                        trajectory_norm,
+                        args.context_length,
+                    )
+                    trajectory_outputs = trajectory_head(
+                        model,
+                        input_ids=tokens,
+                        labels=labels,
+                        context_trajectory_norm=context_trajectory_norm,
+                        future_trajectory_norm=future_trajectory_norm,
+                    )
+                    outputs = trajectory_outputs.base_outputs
+                    loss = (
+                        trajectory_outputs.image_loss
+                        + args.trajectory_loss_weight * trajectory_outputs.trajectory_loss
+                        + args.trajectory_velocity_loss_weight * trajectory_outputs.velocity_loss
+                    )
+                    avg_image_loss = accelerator.gather(
+                        trajectory_outputs.image_loss.repeat(batch_size)
+                    ).float().mean()
+                    avg_trajectory_loss = accelerator.gather(
+                        trajectory_outputs.trajectory_loss.repeat(batch_size)
+                    ).float().mean()
+                    avg_trajectory_velocity_loss = accelerator.gather(
+                        trajectory_outputs.velocity_loss.repeat(batch_size)
+                    ).float().mean()
+                elif args.reward_prediction:
                     outputs, rewards = model(**model_input)
+                    loss = outputs.loss
                 else:
                     outputs = model(**model_input)
-                loss = outputs.loss
-                avg_loss = accelerator.gather(loss.repeat(args.per_device_train_batch_size)).float().mean()
+                    loss = outputs.loss
+                avg_loss = accelerator.gather(loss.repeat(batch_size)).float().mean()
                 if args.action_recon:
                     avg_action_recon_loss = accelerator.gather(accelerator.unwrap_model(
-                        model).action_recon_loss.repeat(args.per_device_train_batch_size)).float().mean()
+                        model).action_recon_loss.repeat(batch_size)).float().mean()
                 accelerator.backward(loss)
 
                 if args.max_grad_norm is not None and accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    clip_parameters = list(model.parameters())
+                    if trajectory_head is not None:
+                        clip_parameters.extend(trajectory_head.parameters())
+                    accelerator.clip_grad_norm_(clip_parameters, args.max_grad_norm)
 
                 optimizer.step()
                 lr_scheduler.step()
@@ -886,6 +1041,12 @@ def start_train():
                         "lr": lr_scheduler.get_last_lr()[0],
                         "loss": avg_loss.item(),
                     }
+                    if args.use_trajectory_head:
+                        logs.update({
+                            "image_loss": avg_image_loss.item(),
+                            "trajectory_loss": avg_trajectory_loss.item(),
+                            "trajectory_velocity_loss": avg_trajectory_velocity_loss.item(),
+                        })
                     if args.action_recon:
                         logs.update({"action_recon_loss": avg_action_recon_loss.item()})
                     accelerator.log(logs, step=completed_steps)
@@ -896,6 +1057,12 @@ def start_train():
                     if args.output_dir is not None:
                         output_dir = os.path.join(args.output_dir, output_dir)
                     accelerator.save_state(output_dir)
+                    if trajectory_head is not None and accelerator.is_main_process:
+                        save_trajectory_head(
+                            output_dir,
+                            accelerator.unwrap_model(trajectory_head),
+                            save_function=accelerator.save,
+                        )
                     lastest_output_dir = output_dir
                     lastest_completed_steps = completed_steps
                     if args.latest_checkpoint_only:
@@ -907,7 +1074,16 @@ def start_train():
             if accelerator.sync_gradients:
                 # Validation
                 if completed_steps == args.max_train_steps or (completed_steps % args.validation_steps == 1 and (completed_steps > 1 or not args.skip_first_val)):
-                    evaluate(args, accelerator, tokenizer, model, eval_dataloader, evaluator, completed_steps)
+                    evaluate(
+                        args,
+                        accelerator,
+                        tokenizer,
+                        model,
+                        eval_dataloader,
+                        evaluator,
+                        completed_steps,
+                        trajectory_head=trajectory_head,
+                    )
 
                 # if avg_loss > 4.0:
                 #     accelerator.load_state(lastest_output_dir)
@@ -931,6 +1107,12 @@ def start_train():
         unwrapped_model.save_pretrained(
             args.output_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save
         )
+        if trajectory_head is not None and accelerator.is_main_process:
+            save_trajectory_head(
+                args.output_dir,
+                accelerator.unwrap_model(trajectory_head),
+                save_function=accelerator.save,
+            )
 
 
 if __name__ == "__main__":

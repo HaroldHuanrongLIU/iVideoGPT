@@ -18,6 +18,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from ivideogpt.data import DEFAULT_SURGWMBENCH_ROOT, SurgWMBenchAnchorDataset
+from ivideogpt.transformer import load_trajectory_head
 from ivideogpt.vq_model import CompressiveVQModel
 
 
@@ -27,6 +28,8 @@ def parse_args():
     parser.add_argument("--manifest", default="manifests/test.jsonl")
     parser.add_argument("--tokenizer_path", required=True)
     parser.add_argument("--transformer_path", required=True)
+    parser.add_argument("--use_trajectory_head", action="store_true")
+    parser.add_argument("--trajectory_head_path", default=None)
     parser.add_argument("--output_dir", default="benchmark/outputs/ivideogpt_surgwmbench_anchor")
     parser.add_argument("--resolution", type=int, default=256)
     parser.add_argument("--context_length", type=int, default=5)
@@ -92,6 +95,34 @@ def mean_records(records):
     return {key: float(np.mean([record[key] for record in records])) for key in keys}
 
 
+def image_width_height(image_size):
+    if isinstance(image_size, dict):
+        return float(image_size["width"]), float(image_size["height"])
+    return float(image_size[0]), float(image_size[1])
+
+
+def norm_to_px(norm_coords: torch.Tensor, image_size) -> torch.Tensor:
+    width, height = image_width_height(image_size)
+    scale = torch.tensor([width, height], dtype=norm_coords.dtype, device=norm_coords.device)
+    return norm_coords * scale
+
+
+def trajectory_horizon_metrics(pred_norm, gt_norm, image_size, horizon):
+    pred_slice = pred_norm[:horizon]
+    gt_slice = gt_norm[:horizon]
+    norm_dist = torch.linalg.vector_norm(pred_slice - gt_slice, dim=-1)
+
+    pred_px = norm_to_px(pred_slice, image_size)
+    gt_px = norm_to_px(gt_slice, image_size)
+    px_dist = torch.linalg.vector_norm(pred_px - gt_px, dim=-1)
+    return {
+        "ade_norm": norm_dist.mean().item(),
+        "fde_norm": norm_dist[-1].item(),
+        "ade_px": px_dist.mean().item(),
+        "fde_px": px_dist[-1].item(),
+    }
+
+
 def summarize(records):
     overall = mean_records(records)
     by_difficulty = {}
@@ -116,6 +147,7 @@ def main():
         image_size=args.resolution,
         max_samples=args.max_clips,
         return_metadata=True,
+        return_trajectory=args.use_trajectory_head,
     )
 
     tokenizer = CompressiveVQModel.from_pretrained(
@@ -138,6 +170,11 @@ def main():
             f"vocab size {expected_vocab_size}."
         )
 
+    trajectory_head = None
+    if args.use_trajectory_head:
+        trajectory_head_path = args.trajectory_head_path or args.transformer_path
+        trajectory_head = load_trajectory_head(trajectory_head_path, map_location=device).eval().to(device)
+
     try:
         import lpips
         import piqa
@@ -155,6 +192,8 @@ def main():
         "horizon_15": 15,
     }
     records_by_horizon = {name: [] for name in horizons}
+    trajectory_records_by_horizon = {name: [] for name in horizons}
+    trajectory_prediction_records = []
     sample_artifacts = []
 
     context_token_count = args.context_length * (1 + args.context_token_grid ** 2)
@@ -164,17 +203,47 @@ def main():
         sample = dataset[clip_idx]
         pixel_values = sample["pixel_values"].unsqueeze(0).to(device)
         metadata = sample["metadata"]
+        if args.use_trajectory_head:
+            trajectory_norm = sample["trajectory_norm"].unsqueeze(0).to(device)
+            context_trajectory_norm = trajectory_norm[:, :args.context_length]
+            future_trajectory_norm = trajectory_norm[:, args.context_length:]
+        else:
+            context_trajectory_norm = None
+            future_trajectory_norm = None
 
         tokens, _ = tokenizer.tokenize(pixel_values, args.context_length)
         gen_input = tokens[:, :context_token_count]
-        generated_tokens = model.generate(
-            gen_input,
-            do_sample=args.do_sample,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=50256,
-        )
+        if args.use_trajectory_head:
+            generated_tokens = trajectory_head.generate_tokens(
+                model,
+                gen_input,
+                context_trajectory_norm,
+                do_sample=args.do_sample,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                max_new_tokens=max_new_tokens,
+            )
+            pred_future_trajectory_norm = trajectory_head.predict_trajectory(
+                model,
+                generated_tokens,
+                context_trajectory_norm,
+            )[0].cpu()
+            gt_future_trajectory_norm = future_trajectory_norm[0].cpu()
+            pred_future_trajectory_px = norm_to_px(pred_future_trajectory_norm, metadata["image_size"])
+            gt_future_trajectory_px = norm_to_px(gt_future_trajectory_norm, metadata["image_size"])
+        else:
+            generated_tokens = model.generate(
+                gen_input,
+                do_sample=args.do_sample,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                max_new_tokens=max_new_tokens,
+                pad_token_id=50256,
+            )
+            pred_future_trajectory_norm = None
+            gt_future_trajectory_norm = None
+            pred_future_trajectory_px = None
+            gt_future_trajectory_px = None
         prediction = tokenizer.detokenize(generated_tokens, args.context_length).clamp(0.0, 1.0).cpu()
 
         per_future_frame = []
@@ -209,6 +278,34 @@ def main():
             })
             records_by_horizon[horizon_name].append(horizon_metrics)
 
+            if args.use_trajectory_head:
+                trajectory_metrics = trajectory_horizon_metrics(
+                    pred_future_trajectory_norm,
+                    gt_future_trajectory_norm,
+                    metadata["image_size"],
+                    horizon,
+                )
+                trajectory_metrics.update({
+                    "difficulty": metadata["difficulty"],
+                    "patient_id": metadata["patient_id"],
+                    "trajectory_id": metadata["trajectory_id"],
+                })
+                trajectory_records_by_horizon[horizon_name].append(trajectory_metrics)
+
+        if args.use_trajectory_head:
+            trajectory_prediction_records.append({
+                "patient_id": metadata["patient_id"],
+                "source_video_id": metadata["source_video_id"],
+                "trajectory_id": metadata["trajectory_id"],
+                "difficulty": metadata["difficulty"],
+                "image_size": metadata["image_size"],
+                "context_trajectory_norm": sample["trajectory_norm"][:args.context_length].tolist(),
+                "gt_future_trajectory_norm": gt_future_trajectory_norm.tolist(),
+                "pred_future_trajectory_norm": pred_future_trajectory_norm.tolist(),
+                "gt_future_trajectory_px": gt_future_trajectory_px.tolist(),
+                "pred_future_trajectory_px": pred_future_trajectory_px.tolist(),
+            })
+
         if clip_idx < args.num_artifacts:
             for horizon_name, horizon in horizons.items():
                 frames = []
@@ -229,6 +326,7 @@ def main():
         "manifest": args.manifest,
         "tokenizer_path": args.tokenizer_path,
         "transformer_path": args.transformer_path,
+        "trajectory_head_path": args.trajectory_head_path or (args.transformer_path if args.use_trajectory_head else None),
         "model_resolution": [args.resolution, args.resolution],
         "original_resolution": [1920, 1080],
         "context_anchor_count": args.context_length,
@@ -245,10 +343,21 @@ def main():
         ),
         "num_clips": len(dataset),
         "metrics": {name: summarize(records) for name, records in records_by_horizon.items()},
+        "trajectory_metrics": (
+            {name: summarize(records) for name, records in trajectory_records_by_horizon.items()}
+            if args.use_trajectory_head
+            else {}
+        ),
         "sample_artifacts": sample_artifacts,
     }
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.use_trajectory_head:
+        predictions_path = output_dir / "predictions.jsonl"
+        predictions_path.write_text(
+            "\n".join(json.dumps(record) for record in trajectory_prediction_records) + "\n"
+        )
+        metrics["trajectory_predictions_path"] = str(predictions_path)
     metrics_path = output_dir / "metrics.json"
     metrics_path.write_text(json.dumps(metrics, indent=2))
     print(json.dumps(metrics, indent=2))

@@ -57,11 +57,13 @@ class SurgWMBenchAnchorDataset(data.Dataset):
         image_size: int = 256,
         max_samples: Optional[int] = None,
         return_metadata: bool = False,
+        return_trajectory: bool = False,
     ):
         self.dataset_root = Path(dataset_root)
         self.manifest = manifest
         self.image_size = image_size
         self.return_metadata = return_metadata
+        self.return_trajectory = return_trajectory
         self.rows = _load_manifest(self.dataset_root, manifest)
         if max_samples is not None:
             self.rows = self.rows[:max_samples]
@@ -92,6 +94,58 @@ class SurgWMBenchAnchorDataset(data.Dataset):
         frames_by_idx = {frame["local_frame_idx"]: frame for frame in annotation["frames"]}
         return [frames_by_idx[idx] for idx in local_indices]
 
+    def _image_width_height(self, annotation: Dict[str, Any]) -> tuple[float, float]:
+        image_size = annotation.get("image_size") or {}
+        if isinstance(image_size, dict):
+            width = image_size.get("width")
+            height = image_size.get("height")
+        else:
+            width, height = image_size
+        if width is None or height is None:
+            raise ValueError(
+                f"Missing image_size width/height for {annotation.get('patient_id')}/"
+                f"{annotation.get('trajectory_id')}"
+            )
+        return float(width), float(height)
+
+    def _anchor_trajectories(
+        self,
+        annotation: Dict[str, Any],
+        anchor_frames: List[Dict[str, Any]],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        anchors = sorted(annotation["human_anchors"], key=lambda item: item["anchor_idx"])
+        width, height = self._image_width_height(annotation)
+        norm_coords = []
+        px_coords = []
+        for anchor, frame in zip(anchors, anchor_frames):
+            norm = (
+                anchor.get("human_coord_norm")
+                or anchor.get("coord_norm")
+                or frame.get("human_coord_norm")
+                or frame.get("coord_norm")
+            )
+            px = (
+                anchor.get("human_coord_px")
+                or anchor.get("coord_px")
+                or frame.get("human_coord_px")
+                or frame.get("coord_px")
+            )
+            if norm is None and px is None:
+                raise ValueError(
+                    f"Missing human anchor coordinate for {annotation.get('patient_id')}/"
+                    f"{annotation.get('trajectory_id')} anchor {anchor.get('anchor_idx')}"
+                )
+            if norm is None:
+                norm = [float(px[0]) / width, float(px[1]) / height]
+            if px is None:
+                px = [float(norm[0]) * width, float(norm[1]) * height]
+            norm_coords.append([float(norm[0]), float(norm[1])])
+            px_coords.append([float(px[0]), float(px[1])])
+        return (
+            torch.tensor(norm_coords, dtype=torch.float32),
+            torch.tensor(px_coords, dtype=torch.float32),
+        )
+
     def _load_frame_tensor(self, frame_path: Union[str, Path]) -> torch.Tensor:
         path = _resolve_dataset_path(self.dataset_root, frame_path)
         if not path.exists():
@@ -112,22 +166,34 @@ class SurgWMBenchAnchorDataset(data.Dataset):
         anchor_frames = self._anchor_frames(annotation)
         pixel_values = torch.stack([self._load_frame_tensor(frame["frame_path"]) for frame in anchor_frames])
 
-        if not self.return_metadata:
+        if not self.return_metadata and not self.return_trajectory:
             return pixel_values
 
-        metadata = {
-            "dataset_version": row.get("dataset_version"),
-            "patient_id": row.get("patient_id"),
-            "source_video_id": row.get("source_video_id"),
-            "trajectory_id": row.get("trajectory_id"),
-            "difficulty": row.get("difficulty"),
-            "annotation_path": row.get("annotation_path"),
-            "num_frames": row.get("num_frames"),
-            "image_size": annotation.get("image_size"),
-            "sampled_indices": [frame["local_frame_idx"] for frame in anchor_frames],
-            "anchor_frame_paths": [frame["frame_path"] for frame in anchor_frames],
-        }
-        return {"pixel_values": pixel_values, "metadata": metadata}
+        sample = {"pixel_values": pixel_values}
+
+        if self.return_trajectory:
+            trajectory_norm, trajectory_px = self._anchor_trajectories(annotation, anchor_frames)
+            sample.update({
+                "trajectory_norm": trajectory_norm,
+                "trajectory_px": trajectory_px,
+            })
+
+        if self.return_metadata:
+            metadata = {
+                "dataset_version": row.get("dataset_version"),
+                "patient_id": row.get("patient_id"),
+                "source_video_id": row.get("source_video_id"),
+                "trajectory_id": row.get("trajectory_id"),
+                "difficulty": row.get("difficulty"),
+                "annotation_path": row.get("annotation_path"),
+                "num_frames": row.get("num_frames"),
+                "image_size": annotation.get("image_size"),
+                "sampled_indices": [frame["local_frame_idx"] for frame in anchor_frames],
+                "anchor_frame_paths": [frame["frame_path"] for frame in anchor_frames],
+            }
+            sample["metadata"] = metadata
+
+        return sample
 
 
 def make_surgwmbench_anchor_dataloader(
@@ -139,12 +205,16 @@ def make_surgwmbench_anchor_dataloader(
     max_samples: Optional[int] = None,
     shuffle: bool = False,
     drop_last: bool = False,
+    return_metadata: bool = False,
+    return_trajectory: bool = False,
 ):
     dataset = SurgWMBenchAnchorDataset(
         dataset_root=dataset_root,
         manifest=manifest,
         image_size=image_size,
         max_samples=max_samples,
+        return_metadata=return_metadata,
+        return_trajectory=return_trajectory,
     )
     return data.DataLoader(
         dataset,
