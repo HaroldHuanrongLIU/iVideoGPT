@@ -205,6 +205,20 @@ def split_context_future_trajectory(trajectory_norm, context_length):
     return trajectory_norm[:, :context_length], trajectory_norm[:, context_length:]
 
 
+def augment_context_trajectory_conditions(context_trajectory_norm, noise_std=0.0, mask_prob=0.0):
+    conditioned = context_trajectory_norm
+    context_trajectory_mask = None
+    if noise_std > 0:
+        conditioned = (conditioned + torch.randn_like(conditioned) * noise_std).clamp(0.0, 1.0)
+    if mask_prob > 0:
+        context_trajectory_mask = torch.rand(
+            conditioned.shape[:2],
+            device=conditioned.device,
+        ) < mask_prob
+        conditioned = conditioned.masked_fill(context_trajectory_mask.unsqueeze(-1), 0.0)
+    return conditioned, context_trajectory_mask
+
+
 def generate_multiple_times(
     gen_times,
     accelerator,
@@ -348,6 +362,18 @@ def parse_args():
     parser.add_argument('--trajectory_head_path', default=None, type=str)
     parser.add_argument('--trajectory_loss_weight', default=1.0, type=float)
     parser.add_argument('--trajectory_velocity_loss_weight', default=0.1, type=float)
+    parser.add_argument(
+        '--trajectory_condition_noise_std',
+        default=0.0,
+        type=float,
+        help='Gaussian noise std added to normalized context trajectory coordinates during joint training.',
+    )
+    parser.add_argument(
+        '--trajectory_condition_mask_prob',
+        default=0.0,
+        type=float,
+        help='Probability of replacing a context trajectory point with the learned mask condition during joint training.',
+    )
 
     parser.add_argument("--log_steps", type=int, default=100, help=("Print logs every X steps."))
     parser.add_argument("--validation_steps", type=int, default=5000)
@@ -385,6 +411,14 @@ def parse_args():
         raise ValueError("--use_trajectory_head is only implemented for --dataset_format surgwmbench_anchor.")
     if args.use_trajectory_head and args.action_conditioned:
         raise ValueError("--use_trajectory_head is action-free and cannot be combined with --action_conditioned.")
+    if args.trajectory_condition_noise_std < 0:
+        raise ValueError("--trajectory_condition_noise_std must be non-negative.")
+    if not 0.0 <= args.trajectory_condition_mask_prob <= 1.0:
+        raise ValueError("--trajectory_condition_mask_prob must be in [0, 1].")
+    if not args.use_trajectory_head and (
+        args.trajectory_condition_noise_std > 0 or args.trajectory_condition_mask_prob > 0
+    ):
+        raise ValueError("Trajectory condition augmentation requires --use_trajectory_head.")
 
     return args
 
@@ -982,12 +1016,19 @@ def start_train():
                         trajectory_norm,
                         args.context_length,
                     )
+                    conditioned_trajectory_norm, context_trajectory_mask = augment_context_trajectory_conditions(
+                        context_trajectory_norm,
+                        noise_std=args.trajectory_condition_noise_std,
+                        mask_prob=args.trajectory_condition_mask_prob,
+                    )
                     trajectory_outputs = trajectory_head(
                         model,
                         input_ids=tokens,
                         labels=labels,
-                        context_trajectory_norm=context_trajectory_norm,
+                        context_trajectory_norm=conditioned_trajectory_norm,
                         future_trajectory_norm=future_trajectory_norm,
+                        context_trajectory_mask=context_trajectory_mask,
+                        loss_context_trajectory_norm=context_trajectory_norm,
                     )
                     outputs = trajectory_outputs.base_outputs
                     loss = (
@@ -1004,6 +1045,11 @@ def start_train():
                     avg_trajectory_velocity_loss = accelerator.gather(
                         trajectory_outputs.velocity_loss.repeat(batch_size)
                     ).float().mean()
+                    avg_trajectory_condition_mask_ratio = None
+                    if context_trajectory_mask is not None:
+                        avg_trajectory_condition_mask_ratio = accelerator.gather(
+                            context_trajectory_mask.float().mean().repeat(batch_size)
+                        ).float().mean()
                 elif args.reward_prediction:
                     outputs, rewards = model(**model_input)
                     loss = outputs.loss
@@ -1047,6 +1093,8 @@ def start_train():
                             "trajectory_loss": avg_trajectory_loss.item(),
                             "trajectory_velocity_loss": avg_trajectory_velocity_loss.item(),
                         })
+                        if avg_trajectory_condition_mask_ratio is not None:
+                            logs["trajectory_condition_mask_ratio"] = avg_trajectory_condition_mask_ratio.item()
                     if args.action_recon:
                         logs.update({"action_recon_loss": avg_action_recon_loss.item()})
                     accelerator.log(logs, step=completed_steps)

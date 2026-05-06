@@ -47,6 +47,7 @@ class SurgWMTrajectoryHead(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size),
         )
+        self.mask_embedding = nn.Parameter(torch.zeros(hidden_size))
         self.prediction_head = nn.Sequential(
             nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size),
@@ -86,15 +87,26 @@ class SurgWMTrajectoryHead(nn.Module):
         base_model: nn.Module,
         input_ids: torch.Tensor,
         context_trajectory_norm: torch.Tensor,
+        context_trajectory_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if context_trajectory_norm.shape[1] != self.config.context_length:
             raise ValueError(
                 f"Expected {self.config.context_length} context trajectory points, "
                 f"got {context_trajectory_norm.shape[1]}."
             )
+        if context_trajectory_mask is not None and context_trajectory_mask.shape != context_trajectory_norm.shape[:2]:
+            raise ValueError(
+                f"context_trajectory_mask must have shape {context_trajectory_norm.shape[:2]}, "
+                f"got {context_trajectory_mask.shape}."
+            )
         embedding_owner = base_model.module if hasattr(base_model, "module") else base_model
         inputs_embeds = embedding_owner.get_input_embeddings()(input_ids).clone()
         trajectory_embeds = self.context_proj(context_trajectory_norm.to(inputs_embeds.dtype))
+        mask_embedding = self.mask_embedding.to(inputs_embeds.dtype).view(1, 1, -1)
+        trajectory_embeds = trajectory_embeds + mask_embedding * 0.0
+        if context_trajectory_mask is not None:
+            mask = context_trajectory_mask.to(device=inputs_embeds.device, dtype=torch.bool).unsqueeze(-1)
+            trajectory_embeds = torch.where(mask, mask_embedding, trajectory_embeds)
         for frame_idx, (start, end) in enumerate(self.context_frame_token_slices()):
             clipped_end = min(end, inputs_embeds.shape[1])
             if start >= clipped_end:
@@ -110,8 +122,14 @@ class SurgWMTrajectoryHead(nn.Module):
         input_ids: torch.Tensor,
         context_trajectory_norm: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
+        context_trajectory_mask: Optional[torch.Tensor] = None,
     ):
-        inputs_embeds = self.build_conditioned_inputs_embeds(base_model, input_ids, context_trajectory_norm)
+        inputs_embeds = self.build_conditioned_inputs_embeds(
+            base_model,
+            input_ids,
+            context_trajectory_norm,
+            context_trajectory_mask=context_trajectory_mask,
+        )
         return base_model(
             inputs_embeds=inputs_embeds,
             labels=labels,
@@ -152,12 +170,15 @@ class SurgWMTrajectoryHead(nn.Module):
         context_trajectory_norm: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         future_trajectory_norm: Optional[torch.Tensor] = None,
+        context_trajectory_mask: Optional[torch.Tensor] = None,
+        loss_context_trajectory_norm: Optional[torch.Tensor] = None,
     ) -> SimpleNamespace:
         base_outputs = self._base_outputs(
             base_model=base_model,
             input_ids=input_ids,
             context_trajectory_norm=context_trajectory_norm,
             labels=labels,
+            context_trajectory_mask=context_trajectory_mask,
         )
         pred_norm = self._trajectory_from_hidden_states(base_outputs.hidden_states[-1])
         trajectory_loss = None
@@ -166,7 +187,11 @@ class SurgWMTrajectoryHead(nn.Module):
             trajectory_loss, velocity_loss = self.trajectory_losses(
                 pred_norm=pred_norm,
                 future_trajectory_norm=future_trajectory_norm,
-                context_trajectory_norm=context_trajectory_norm,
+                context_trajectory_norm=(
+                    context_trajectory_norm
+                    if loss_context_trajectory_norm is None
+                    else loss_context_trajectory_norm
+                ),
             )
         return SimpleNamespace(
             base_outputs=base_outputs,
@@ -186,6 +211,7 @@ class SurgWMTrajectoryHead(nn.Module):
         do_sample: bool = False,
         temperature: float = 1.0,
         top_k: int = 0,
+        context_trajectory_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         generated = input_ids
         for _ in range(max_new_tokens):
@@ -194,6 +220,7 @@ class SurgWMTrajectoryHead(nn.Module):
                 input_ids=generated,
                 context_trajectory_norm=context_trajectory_norm,
                 labels=None,
+                context_trajectory_mask=context_trajectory_mask,
             )
             logits = outputs.logits[:, -1, :]
             if temperature <= 0:
@@ -215,12 +242,14 @@ class SurgWMTrajectoryHead(nn.Module):
         base_model: nn.Module,
         input_ids: torch.Tensor,
         context_trajectory_norm: torch.Tensor,
+        context_trajectory_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         outputs = self._base_outputs(
             base_model=base_model,
             input_ids=input_ids,
             context_trajectory_norm=context_trajectory_norm,
             labels=None,
+            context_trajectory_mask=context_trajectory_mask,
         )
         return self._trajectory_from_hidden_states(outputs.hidden_states[-1])
 
@@ -252,5 +281,9 @@ def load_trajectory_head(
     config = SurgWMTrajectoryHeadConfig(**json.loads(config_path.read_text()))
     trajectory_head = SurgWMTrajectoryHead(**asdict(config))
     state_dict = torch.load(state_path, map_location=map_location)
-    trajectory_head.load_state_dict(state_dict)
+    missing, unexpected = trajectory_head.load_state_dict(state_dict, strict=False)
+    if unexpected or [key for key in missing if key != "mask_embedding"]:
+        raise RuntimeError(
+            f"Could not load trajectory head cleanly: missing={missing}, unexpected={unexpected}"
+        )
     return trajectory_head

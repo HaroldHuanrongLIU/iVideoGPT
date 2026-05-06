@@ -203,6 +203,38 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -m accelerate.commands.launch \
   --max_decode_batchsize 1
 ```
 
+### Robust Trajectory-Condition Training
+
+Robust condition augmentation is only for joint training. It perturbs the first
+5 input trajectory points; future trajectory labels stay unchanged. By default
+it is disabled with `--trajectory_condition_noise_std 0.0` and
+`--trajectory_condition_mask_prob 0.0`.
+
+Add Gaussian noise to normalized context coordinates:
+
+```bash
+  --use_trajectory_head \
+  --trajectory_condition_noise_std 0.02
+```
+
+Randomly mask context trajectory points with a learned mask condition:
+
+```bash
+  --use_trajectory_head \
+  --trajectory_condition_mask_prob 0.2
+```
+
+Use both augmentations together:
+
+```bash
+  --use_trajectory_head \
+  --trajectory_condition_noise_std 0.02 \
+  --trajectory_condition_mask_prob 0.2
+```
+
+Do not pass these flags for image-only training. Evaluation normally uses clean
+context trajectories and does not need the robust-training flags.
+
 Keep the per-device batch size small for 256x256 training. The examples use
 batch size 1 per GPU with gradient accumulation 4. The training code prepares
 train and validation dataloaders with Accelerate so each process receives a

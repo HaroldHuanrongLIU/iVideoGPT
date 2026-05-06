@@ -72,6 +72,57 @@ def test_trajectory_head_forward_predicts_future_anchor_points():
     assert torch.all(outputs.trajectory_pred_norm <= 1.0)
 
 
+def test_mask_embedding_is_used_without_mask_for_ddp():
+    torch.manual_seed(0)
+    base_model = TinyCausalLM()
+    head = SurgWMTrajectoryHead(hidden_size=8, context_length=5, segment_length=20)
+    input_ids = torch.randint(0, base_model.config.vocab_size, (2, 1539))
+    labels = torch.randint(0, base_model.config.vocab_size, (2, 1539))
+    labels[:, :1285] = -100
+    context_trajectory = torch.rand(2, 5, 2)
+    future_trajectory = torch.rand(2, 15, 2)
+
+    outputs = head(
+        base_model,
+        input_ids=input_ids,
+        labels=labels,
+        context_trajectory_norm=context_trajectory,
+        future_trajectory_norm=future_trajectory,
+    )
+    (outputs.image_loss + outputs.trajectory_loss + outputs.velocity_loss).backward()
+
+    assert head.mask_embedding.grad is not None
+
+
+def test_trajectory_head_accepts_masked_context_conditions():
+    torch.manual_seed(0)
+    base_model = TinyCausalLM()
+    head = SurgWMTrajectoryHead(hidden_size=8, context_length=5, segment_length=20)
+    input_ids = torch.randint(0, base_model.config.vocab_size, (2, 1539))
+    labels = torch.randint(0, base_model.config.vocab_size, (2, 1539))
+    labels[:, :1285] = -100
+    context_trajectory = torch.rand(2, 5, 2)
+    future_trajectory = torch.rand(2, 15, 2)
+    context_mask = torch.tensor([
+        [False, True, False, False, True],
+        [True, False, False, True, False],
+    ])
+
+    outputs = head(
+        base_model,
+        input_ids=input_ids,
+        labels=labels,
+        context_trajectory_norm=context_trajectory.masked_fill(context_mask.unsqueeze(-1), 0.0),
+        future_trajectory_norm=future_trajectory,
+        context_trajectory_mask=context_mask,
+        loss_context_trajectory_norm=context_trajectory,
+    )
+
+    assert outputs.trajectory_pred_norm.shape == (2, 15, 2)
+    assert outputs.trajectory_loss.ndim == 0
+    assert outputs.velocity_loss.ndim == 0
+
+
 def test_trajectory_head_save_load_round_trip(tmp_path):
     head = SurgWMTrajectoryHead(hidden_size=8, context_length=5, segment_length=20)
     save_trajectory_head(tmp_path, head)
@@ -81,3 +132,16 @@ def test_trajectory_head_save_load_round_trip(tmp_path):
     assert loaded.config == head.config
     assert (tmp_path / "trajectory_head.pt").exists()
     assert (tmp_path / "trajectory_head_config.json").exists()
+
+
+def test_trajectory_head_loads_pre_mask_checkpoint(tmp_path):
+    head = SurgWMTrajectoryHead(hidden_size=8, context_length=5, segment_length=20)
+    save_trajectory_head(tmp_path, head)
+    state_dict = torch.load(tmp_path / "trajectory_head.pt")
+    state_dict.pop("mask_embedding")
+    torch.save(state_dict, tmp_path / "trajectory_head.pt")
+
+    loaded = load_trajectory_head(tmp_path)
+
+    assert loaded.config == head.config
+    assert loaded.mask_embedding.shape == head.mask_embedding.shape
