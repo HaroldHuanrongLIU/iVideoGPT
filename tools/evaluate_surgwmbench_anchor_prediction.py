@@ -50,7 +50,32 @@ def parse_args():
         help="'original': resize predictions to original frame size and score there. "
              "'model': downsample GT to model resolution and score there (no upsample).",
     )
+    parser.add_argument(
+        "--trajectory_condition_noise_std",
+        type=float,
+        default=0.0,
+        help="Inference-time Gaussian noise std added to normalized context trajectory coordinates.",
+    )
+    parser.add_argument(
+        "--trajectory_condition_mask_prob",
+        type=float,
+        default=0.0,
+        help="Inference-time probability of replacing each context trajectory point with the learned mask condition.",
+    )
     return parser.parse_args()
+
+
+def augment_context_trajectory_conditions(context_trajectory_norm, noise_std=0.0, mask_prob=0.0):
+    conditioned = context_trajectory_norm
+    context_trajectory_mask = None
+    if noise_std > 0:
+        conditioned = (conditioned + torch.randn_like(conditioned) * noise_std).clamp(0.0, 1.0)
+    if mask_prob > 0:
+        context_trajectory_mask = torch.rand(
+            conditioned.shape[:2],
+            device=conditioned.device,
+        ) < mask_prob
+    return conditioned, context_trajectory_mask
 
 
 def resolve_device(device_arg: str) -> torch.device:
@@ -174,6 +199,16 @@ def main():
     if args.use_trajectory_head:
         trajectory_head_path = args.trajectory_head_path or args.transformer_path
         trajectory_head = load_trajectory_head(trajectory_head_path, map_location=device).eval().to(device)
+    if not args.use_trajectory_head and (
+        args.trajectory_condition_noise_std > 0 or args.trajectory_condition_mask_prob > 0
+    ):
+        raise ValueError(
+            "--trajectory_condition_noise_std/--trajectory_condition_mask_prob require --use_trajectory_head."
+        )
+    if args.trajectory_condition_noise_std < 0:
+        raise ValueError("--trajectory_condition_noise_std must be non-negative.")
+    if not 0.0 <= args.trajectory_condition_mask_prob <= 1.0:
+        raise ValueError("--trajectory_condition_mask_prob must be in [0, 1].")
 
     try:
         import lpips
@@ -214,19 +249,26 @@ def main():
         tokens, _ = tokenizer.tokenize(pixel_values, args.context_length)
         gen_input = tokens[:, :context_token_count]
         if args.use_trajectory_head:
+            conditioned_context_trajectory_norm, context_trajectory_mask = augment_context_trajectory_conditions(
+                context_trajectory_norm,
+                noise_std=args.trajectory_condition_noise_std,
+                mask_prob=args.trajectory_condition_mask_prob,
+            )
             generated_tokens = trajectory_head.generate_tokens(
                 model,
                 gen_input,
-                context_trajectory_norm,
+                conditioned_context_trajectory_norm,
                 do_sample=args.do_sample,
                 temperature=args.temperature,
                 top_k=args.top_k,
                 max_new_tokens=max_new_tokens,
+                context_trajectory_mask=context_trajectory_mask,
             )
             pred_future_trajectory_norm = trajectory_head.predict_trajectory(
                 model,
                 generated_tokens,
-                context_trajectory_norm,
+                conditioned_context_trajectory_norm,
+                context_trajectory_mask=context_trajectory_mask,
             )[0].cpu()
             gt_future_trajectory_norm = future_trajectory_norm[0].cpu()
             pred_future_trajectory_px = norm_to_px(pred_future_trajectory_norm, metadata["image_size"])
@@ -336,6 +378,8 @@ def main():
             "horizon_15": "anchors 6-20",
         },
         "metric_resolution": args.metric_resolution,
+        "trajectory_condition_noise_std": args.trajectory_condition_noise_std,
+        "trajectory_condition_mask_prob": args.trajectory_condition_mask_prob,
         "resize_policy": (
             "full-frame bicubic resize to model resolution; predictions bicubic-resized back to original frame size for metrics"
             if args.metric_resolution == "original"
